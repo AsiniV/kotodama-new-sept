@@ -1,0 +1,258 @@
+# =============================================================================
+# KOTODAMA - Unified Docker Compose (Phases 0-9)
+# Optimized for AMD Ryzen AI Max 395 (RDNA 3.5) with Vulkan
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 with PGVector extension for Lore RAG
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kotodama-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kotodama
+      POSTGRES_PASSWORD: kotodama_secret_k8s_key_2026
+      POSTGRES_DB: kotodama
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - kotodama-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kotodama -d kotodama"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # MinIO - S3-compatible Object Storage
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: kotodama-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: kotodama_admin
+      MINIO_ROOT_PASSWORD: kotodama_minio_secret_k8s_key_2026
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - kotodama-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Redis - Caching and Task Queue
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: kotodama-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - kotodama-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Ollama - Local LLM Inference (AMD Ryzen AI Max 395 / RDNA 3.5)
+  # Uses host models directory via bind mount
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kotodama-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      # Bind mount к локальному каталогу Ollama на Windows
+      # Это делает ваши модели (qwen3.6:35b, qwen3-coder:30b) видимыми внутри контейнера
+      - C:/Users/orlov/.ollama:/root/.ollama
+    networks:
+      - kotodama-network
+    environment:
+      # Vulkan configuration for AMD GPU
+      - AMD_VULKAN_ICD=RADV
+      - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      # RDNA 3.5 (gfx1151) - override to gfx1100 for broader compatibility
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      # Ollama tuning for 64GB VRAM
+      - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KEEP_ALIVE=24h
+      # Disable CUDA detection (we're using Vulkan)
+      - CUDA_VISIBLE_DEVICES=-1
+      - HIP_VISIBLE_DEVICES=-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # FastAPI Backend Service
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: kotodama-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://kotodama:kotodama_secret_k8s_key_2026@postgres:5432/kotodama
+      REDIS_URL: redis://redis:6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: kotodama_admin
+      MINIO_SECRET_KEY: kotodama_minio_secret_k8s_key_2026
+      MINIO_BUCKET_ASSETS: kotodama-assets
+      MINIO_BUCKET_BUILDS: kotodama-builds
+      MINIO_SECURE: "false"
+      OLLAMA_BASE_URL: http://ollama:11434
+      LOG_LEVEL: INFO
+      DEBUG: "true"
+      SECRET_KEY: ${SECRET_KEY:-kotodama_dev_secret_key_change_in_production}
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:8000,http://nginx:80"
+      # AMD GPU info for logging
+      GPU_VENDOR: AMD
+      GPU_MODEL: Ryzen AI Max 395 (Radeon 8060S)
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./godot_core:/app/godot_core:ro
+      - workspace_data:/app/workspace
+      - ./configs:/app/configs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - kotodama-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Godot Headless Worker - Testing and Builds
+  # ---------------------------------------------------------------------------
+  godot-headless:
+    image: barichello/godot-ci:4.3
+    container_name: kotodama-godot
+    restart: unless-stopped
+    volumes:
+      - ./godot_core:/godot/core:ro
+      - workspace_data:/godot/workspace
+      - godot_cache:/root/.local/share/godot
+    networks:
+      - kotodama-network
+    entrypoint: ["sleep", "infinity"]
+
+  # ---------------------------------------------------------------------------
+  # Next.js Frontend Service
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    container_name: kotodama-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - kotodama-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Nginx Reverse Proxy
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: kotodama-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - kotodama-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_data:
+    driver: local
+  workspace_data:
+    driver: local
+  godot_cache:
+    driver: local
+  nginx_logs:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  kotodama-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
